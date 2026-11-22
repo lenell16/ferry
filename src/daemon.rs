@@ -21,7 +21,7 @@ use crate::proto::{
     ListEntry, Listing, MAGIC, NodeInfo, PROTO_VERSION, Proof, ProtoError, Request, Welcome, Written, mac,
     mac_verify, pair_key, xor32,
 };
-use crate::transfer::{self, WalkOpts, resolve_path};
+use crate::transfer::{self, Partial, WalkOpts, resolve_path};
 
 /// How often the daemon checks that it is still on the right address.
 const WATCH_INTERVAL: Duration = Duration::from_secs(15);
@@ -420,13 +420,13 @@ fn serve(mut conn: Conn, request: Request, daemon: &Daemon, peer: &str) -> Resul
         }
         Request::Write { path } => {
             let resolved = resolve_path(&path, home, home);
-            let tmp = resolved.with_extension(format!("ferry-{}", std::process::id()));
-            let opened = resolved
-                .parent()
-                .map_or(Ok(()), fs::create_dir_all)
-                .and_then(|()| File::create(&tmp));
-            let mut file = match opened {
-                Ok(file) => file,
+            let opened = transfer::follow_links(&resolved).and_then(|target| {
+                target.parent().map_or(Ok(()), fs::create_dir_all)?;
+                let mode = fs::metadata(&target).ok().map(|meta| transfer::mode_bits(&meta));
+                Partial::create(&target, mode).map(|(tmp, file)| (target, tmp, file))
+            });
+            let (target, tmp, mut file) = match opened {
+                Ok(opened) => opened,
                 Err(err) => {
                     let message = format!("{}: {err}", resolved.display());
                     conn.send_err(message.clone())?;
@@ -449,16 +449,13 @@ fn serve(mut conn: Conn, request: Request, daemon: &Daemon, peer: &str) -> Resul
                 }
             };
             drop(file);
-            let outcome = outcome.and_then(|()| fs::rename(&tmp, &resolved).map_err(|err| format!("{}: {err}", resolved.display())));
+            let outcome = outcome.and_then(|()| tmp.finish(&target).map_err(|err| format!("{}: {err}", resolved.display())));
             match outcome {
                 Ok(()) => {
                     conn.send_ok(Written { path: resolved.display().to_string(), bytes: total })?;
                     Ok(format!("wrote {total} bytes to {}", resolved.display()))
                 }
                 Err(message) => {
-                    if let Err(err) = fs::remove_file(&tmp) {
-                        warn!(tmp = %tmp.display(), %err, "left a partial file behind");
-                    }
                     conn.send_err(message.clone())?;
                     Err(ProtoError::Failed(message))
                 }
@@ -505,4 +502,247 @@ fn list(path: &std::path::Path) -> std::io::Result<Vec<ListEntry>> {
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::thread::JoinHandle;
+
+    use super::*;
+    use crate::transfer::{Entry, EntryKind, ManifestChunk, Summary};
+
+    /// A daemon whose home is a temporary directory, removed on drop.
+    struct Fixture {
+        daemon: Arc<Daemon>,
+        home: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if fs::remove_dir_all(&self.home).is_err() {}
+        }
+    }
+
+    type Served = JoinHandle<Result<String, ProtoError>>;
+
+    impl Fixture {
+        fn new() -> Self {
+            let mut id = [0u8; 8];
+            getrandom::fill(&mut id).unwrap();
+            let home = std::env::temp_dir().join(format!("ferry-test-{}", hex_encode(&id)));
+            fs::create_dir(&home).unwrap();
+            let daemon = Arc::new(Daemon {
+                paths: Paths { dir: home.join(".ferry"), home: home.clone() },
+                env: EnvCache::new(),
+                config_lock: Mutex::new(()),
+                tailnet_only: false,
+                limited: false,
+                refuse: None,
+                active: AtomicUsize::new(0),
+            });
+            Self { daemon, home }
+        }
+
+        /// Serves one request and returns the client's end of it.
+        fn request(&self, request: Request) -> (Conn, Served) {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            let daemon = self.daemon.clone();
+            let served = thread::spawn(move || serve(Conn::new(server).unwrap(), request, &daemon, "test"));
+            let conn = Conn::new(client).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            (conn, served)
+        }
+
+        /// Starts a write. The daemon has opened its file when this returns.
+        fn start_write(&self, path: &str) -> (Conn, Served) {
+            let (mut conn, served) = self.request(Request::Write { path: path.into() });
+            conn.recv_reply::<()>().unwrap();
+            (conn, served)
+        }
+
+        #[cfg(unix)]
+        fn write(&self, path: &str, text: &str) {
+            finish_write(self.start_write(path), text);
+        }
+
+        /// Starts copying a file to `a.txt` and sends its contents, but not
+        /// the end. The daemon has written them when this returns.
+        fn start_copy(&self, text: &str, mode: u32) -> (Conn, Served) {
+            let (mut conn, served) = self.request(Request::Push { dest: "a.txt".into(), force: true });
+            let entry = Entry { p: "a.txt".into(), k: EntryKind::File, s: text.len() as u64, m: 1, x: mode, l: None };
+            conn.send_ok(ManifestChunk { entries: vec![entry], last: true, single_file: true }).unwrap();
+            assert!(matches!(conn.recv().unwrap(), (Kind::Need, [0, 0, 0, 0])));
+            conn.send(Kind::FileBegin, &0u32.to_le_bytes()).unwrap();
+            conn.send(Kind::Data, text.as_bytes()).unwrap();
+            conn.flush().unwrap();
+            for _ in 0..1000 {
+                if self.files().iter().any(|path| fs::metadata(path).is_ok_and(|meta| meta.len() == text.len() as u64)) {
+                    return (conn, served);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the daemon never wrote {text:?}");
+        }
+
+        fn files(&self) -> Vec<PathBuf> {
+            fs::read_dir(&self.home).unwrap().map(|dent| dent.unwrap().path()).collect()
+        }
+
+        fn names(&self) -> Vec<String> {
+            let mut names: Vec<String> =
+                self.files().iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        }
+
+        fn read(&self, name: &str) -> String {
+            fs::read_to_string(self.home.join(name)).unwrap()
+        }
+    }
+
+    fn finish_write((mut conn, served): (Conn, Served), text: &str) {
+        conn.send(Kind::Data, text.as_bytes()).unwrap();
+        conn.send(Kind::FileEnd, &[]).unwrap();
+        conn.flush().unwrap();
+        assert_eq!(conn.recv_reply::<Written>().unwrap().bytes, text.len() as u64);
+        served.join().unwrap().unwrap();
+    }
+
+    fn finish_copy((mut conn, served): (Conn, Served)) {
+        conn.send(Kind::FileEnd, &[]).unwrap();
+        conn.send_json(&serde_json::json!({ "errors": [] })).unwrap();
+        assert_eq!(conn.recv_reply::<Summary>().unwrap().errors, Vec::<String>::new());
+        served.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn writes_at_once_to_names_that_differ_by_extension() {
+        let fixture = Fixture::new();
+        let json = fixture.start_write("c.json");
+        let yaml = fixture.start_write("c.yaml");
+        finish_write(json, "json");
+        finish_write(yaml, "yaml");
+        assert_eq!(fixture.read("c.json"), "json");
+        assert_eq!(fixture.read("c.yaml"), "yaml");
+        assert_eq!(fixture.names(), ["c.json", "c.yaml"]);
+    }
+
+    #[test]
+    fn writes_at_once_to_one_file() {
+        let fixture = Fixture::new();
+        let first = fixture.start_write("a.txt");
+        let second = fixture.start_write("a.txt");
+        finish_write(first, "the first");
+        finish_write(second, "second");
+        assert_eq!(fixture.read("a.txt"), "second");
+        assert_eq!(fixture.names(), ["a.txt"]);
+    }
+
+    #[test]
+    fn copies_at_once_to_one_file() {
+        let fixture = Fixture::new();
+        let first = fixture.start_copy("first", 0o644);
+        let second = fixture.start_copy("the second", 0o644);
+        finish_copy(first);
+        finish_copy(second);
+        assert_eq!(fixture.read("a.txt"), "the second");
+        assert_eq!(fixture.names(), ["a.txt"]);
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::path::Path;
+
+        use super::*;
+
+        fn mode(path: &Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o7777
+        }
+
+        fn set_mode(path: &Path, mode: u32) {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        #[test]
+        fn write_keeps_permissions() {
+            let fixture = Fixture::new();
+            let path = fixture.home.join("a.sh");
+            fs::write(&path, "old").unwrap();
+            for bits in [0o600, 0o755, 0o664, 0o400, 0o000] {
+                set_mode(&path, bits);
+                fixture.write("a.sh", "new");
+                assert_eq!(mode(&path), bits, "expected {bits:o}");
+            }
+            set_mode(&path, 0o600);
+            assert_eq!(fixture.read("a.sh"), "new");
+        }
+
+        #[test]
+        fn new_files_get_default_permissions() {
+            let fixture = Fixture::new();
+            fs::write(fixture.home.join("usual"), "").unwrap();
+            fixture.write("new", "text");
+            assert_eq!(mode(&fixture.home.join("new")), mode(&fixture.home.join("usual")));
+        }
+
+        #[test]
+        fn private_files_stay_private_while_being_written() {
+            let fixture = Fixture::new();
+            let path = fixture.home.join("secret");
+            fs::write(&path, "old").unwrap();
+            set_mode(&path, 0o600);
+            let write = fixture.start_write("secret");
+            assert_eq!(fixture.files().iter().map(|path| mode(path)).collect::<Vec<_>>(), [0o600, 0o600]);
+            finish_write(write, "new");
+            fs::remove_file(&path).unwrap();
+
+            let copy = fixture.start_copy("copied", 0o600);
+            assert_eq!(fixture.files().iter().map(|path| mode(path)).collect::<Vec<_>>(), [0o600]);
+            finish_copy(copy);
+        }
+
+        #[test]
+        fn write_goes_through_symlinks() {
+            let fixture = Fixture::new();
+            let target = fixture.home.join("dir").join("target");
+            fs::create_dir(fixture.home.join("dir")).unwrap();
+            fs::write(&target, "old").unwrap();
+            set_mode(&target, 0o600);
+            // A chain: link -> dir/inner -> target, both relative.
+            symlink("dir/inner", fixture.home.join("link")).unwrap();
+            symlink("target", fixture.home.join("dir").join("inner")).unwrap();
+
+            let write = fixture.start_write("link");
+            assert_eq!(fixture.names(), ["dir", "link"], "the temporary file belongs beside the target");
+            finish_write(write, "new");
+            assert_eq!(fs::read_link(fixture.home.join("link")).unwrap(), Path::new("dir/inner"));
+            assert_eq!(fs::read_link(fixture.home.join("dir").join("inner")).unwrap(), Path::new("target"));
+            assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+            assert_eq!(mode(&target), 0o600);
+        }
+
+        #[test]
+        fn write_creates_the_target_of_a_dangling_symlink() {
+            let fixture = Fixture::new();
+            symlink("missing", fixture.home.join("link")).unwrap();
+            fixture.write("link", "new");
+            assert_eq!(fs::read_link(fixture.home.join("link")).unwrap(), Path::new("missing"));
+            assert_eq!(fixture.read("missing"), "new");
+        }
+
+        #[test]
+        fn write_refuses_a_symlink_loop() {
+            let fixture = Fixture::new();
+            symlink("b", fixture.home.join("a")).unwrap();
+            symlink("a", fixture.home.join("b")).unwrap();
+            let (mut conn, served) = fixture.request(Request::Write { path: "a".into() });
+            assert!(conn.recv_reply::<()>().is_err());
+            assert!(served.join().unwrap().is_err());
+            assert_eq!(fixture.names(), ["a", "b"]);
+        }
+    }
 }

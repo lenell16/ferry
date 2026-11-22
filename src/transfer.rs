@@ -3,7 +3,7 @@
 //! functions with the roles swapped.
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -11,9 +11,12 @@ use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use serde::{Deserialize, Serialize};
 
+use crate::config::{hex_encode, random};
 use crate::proto::{CHUNK, Conn, Kind, ProtoError, Reply};
 
 const MANIFEST_BATCH: usize = 4096;
+/// How many symlinks in a row to follow before calling it a loop.
+const MAX_LINKS: usize = 40;
 /// Never worth copying, and `._*` files have broken loaders on Windows.
 const DEFAULT_EXCLUDES: &[&str] = &[".DS_Store", "._*"];
 /// A chunk must shrink by this much to be sent compressed.
@@ -98,6 +101,19 @@ pub fn resolve_path(spec: &str, base: &Path, home: &Path) -> PathBuf {
     if path.is_absolute() { path.to_path_buf() } else { base.join(path) }
 }
 
+/// Follows a symlink to the file it names in the end, which may not exist yet.
+pub fn follow_links(path: &Path) -> io::Result<PathBuf> {
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        // Relative links start from the folder that holds them.
+        match (fs::read_link(&path), path.parent()) {
+            (Ok(link), Some(parent)) => path = parent.join(link),
+            _ => return Ok(path),
+        }
+    }
+    Err(io::Error::other("too many levels of symbolic links"))
+}
+
 pub fn ends_with_separator(spec: &str) -> bool {
     spec.ends_with('/') || (cfg!(windows) && spec.ends_with('\\'))
 }
@@ -111,14 +127,25 @@ pub fn mtime_secs(meta: &fs::Metadata) -> i64 {
 }
 
 #[cfg(unix)]
-fn mode_bits(meta: &fs::Metadata) -> u32 {
+pub fn mode_bits(meta: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     meta.permissions().mode() & 0o7777
 }
 
 #[cfg(not(unix))]
-fn mode_bits(_meta: &fs::Metadata) -> u32 {
+pub fn mode_bits(_meta: &fs::Metadata) -> u32 {
     0
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
 }
 
 fn file_entry(rel: String, meta: &fs::Metadata) -> Entry {
@@ -316,24 +343,58 @@ fn fill(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(filled)
 }
 
-/// A file being received. Removes its temporary file unless it is finished.
-struct Incoming {
-    index: usize,
+/// The temporary file a destination is written to first. Removed on drop
+/// unless it was moved into place.
+pub struct Partial {
     tmp: PathBuf,
-    file: Option<File>,
-    bytes: u64,
-    error: Option<String>,
+    mode: Option<u32>,
 }
 
-impl Drop for Incoming {
+impl Partial {
+    /// Creates one in the same folder as `path`, under a name of its own so
+    /// that writes running at the same time never share it. Given the mode the
+    /// file will end up with, only its owner can open it until then.
+    pub fn create(path: &Path, mode: Option<u32>) -> io::Result<(Self, File)> {
+        let mut id = [0u8; 8];
+        random(&mut id).map_err(io::Error::other)?;
+        let tmp = path.with_file_name(format!(".ferry-{}", hex_encode(&id)));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if mode.is_some() {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&tmp)?;
+        Ok((Self { tmp, mode }, file))
+    }
+
+    /// Sets the final mode and moves the file to `path`.
+    pub fn finish(self, path: &Path) -> io::Result<()> {
+        if let Some(mode) = self.mode {
+            set_mode(&self.tmp, mode)?;
+        }
+        fs::rename(&self.tmp, path)
+    }
+}
+
+impl Drop for Partial {
     fn drop(&mut self) {
-        self.file = None;
         if let Err(err) = fs::remove_file(&self.tmp)
-            && err.kind() != std::io::ErrorKind::NotFound
+            && err.kind() != io::ErrorKind::NotFound
         {
             tracing::warn!(tmp = %self.tmp.display(), %err, "left a partial file behind");
         }
     }
+}
+
+/// A file being received. `file` comes before `tmp` so it is closed first.
+struct Incoming {
+    index: usize,
+    file: Option<File>,
+    tmp: Option<Partial>,
+    bytes: u64,
+    error: Option<String>,
 }
 
 /// Joins a manifest path onto the root, refusing anything that would escape.
@@ -457,7 +518,7 @@ pub fn recv_tree(conn: &mut Conn, dest: &str, base: &Path, home: &Path, force: b
                 let Some(Some(path)) = targets.get(index) else {
                     return Err(ProtoError::Failed("sender offered a file that was not requested".into()));
                 };
-                current = Some(open_incoming(index, path));
+                current = Some(open_incoming(index, path, &entries[index]));
             }
             Kind::Data | Kind::DataLz4 => {
                 let Some(incoming) = current.as_mut() else {
@@ -511,19 +572,18 @@ pub fn recv_tree(conn: &mut Conn, dest: &str, base: &Path, home: &Path, force: b
     Ok(summary)
 }
 
-fn open_incoming(index: usize, path: &Path) -> Incoming {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.ferry-{}", std::process::id()));
-    let opened = File::create(&tmp).or_else(|err| {
+fn open_incoming(index: usize, path: &Path, entry: &Entry) -> Incoming {
+    let mode = (entry.x != 0).then_some(entry.x);
+    let opened = Partial::create(path, mode).or_else(|err| {
         // The manifest lists parents first, but an excluded parent can be missing.
         match (err.kind(), path.parent()) {
-            (std::io::ErrorKind::NotFound, Some(parent)) => fs::create_dir_all(parent).and_then(|()| File::create(&tmp)),
+            (io::ErrorKind::NotFound, Some(parent)) => fs::create_dir_all(parent).and_then(|()| Partial::create(path, mode)),
             _ => Err(err),
         }
     });
     match opened {
-        Ok(file) => Incoming { index, tmp, file: Some(file), bytes: 0, error: None },
-        Err(err) => Incoming { index, tmp, file: None, bytes: 0, error: Some(err.to_string()) },
+        Ok((tmp, file)) => Incoming { index, file: Some(file), tmp: Some(tmp), bytes: 0, error: None },
+        Err(err) => Incoming { index, file: None, tmp: None, bytes: 0, error: Some(err.to_string()) },
     }
 }
 
@@ -537,7 +597,7 @@ fn finish_incoming(mut incoming: Incoming, entry: &Entry, targets: &[Option<Path
     if let Some(error) = incoming.error.take() {
         return Err(describe(&error));
     }
-    let Some(file) = incoming.file.take() else {
+    let (Some(file), Some(tmp)) = (incoming.file.take(), incoming.tmp.take()) else {
         return Err(describe(&"file was never opened"));
     };
     let mtime = if entry.m >= 0 {
@@ -547,11 +607,6 @@ fn finish_incoming(mut incoming: Incoming, entry: &Entry, targets: &[Option<Path
     };
     file.set_modified(mtime).map_err(|err| describe(&err))?;
     drop(file);
-    #[cfg(unix)]
-    if entry.x != 0 {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&incoming.tmp, fs::Permissions::from_mode(entry.x & 0o7777)).map_err(|err| describe(&err))?;
-    }
-    fs::rename(&incoming.tmp, path).map_err(|err| describe(&err))?;
+    tmp.finish(path).map_err(|err| describe(&err))?;
     Ok(incoming.bytes)
 }
